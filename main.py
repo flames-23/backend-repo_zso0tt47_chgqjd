@@ -68,10 +68,10 @@ def test_database():
     return response
 
 # Email sending via SMTP or service provider is often blocked in ephemeral envs.
-# We'll implement a simple stub that stores messages and, if SMTP creds exist,
-# attempts to send using Python's smtplib. Fallback to store-only.
+# We'll implement a robust sender that supports STARTTLS (587) and SSL (465).
 import smtplib
 from email.mime.text import MIMEText
+from email.utils import formataddr
 
 SMTP_HOST = os.getenv("SMTP_HOST")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -85,6 +85,49 @@ class ContactIn(BaseModel):
     email: EmailStr
     message: str
 
+@app.get("/api/contact/health")
+def contact_health():
+    configured = bool(SMTP_HOST and SMTP_USER and SMTP_PASS)
+    return {
+        "smtp_configured": configured,
+        "host": "set" if SMTP_HOST else None,
+        "port": SMTP_PORT,
+        "from_email": FROM_EMAIL if configured else None,
+        "target_email": TARGET_EMAIL,
+        "mode": "SSL" if SMTP_PORT == 465 else "STARTTLS",
+    }
+
+
+def send_email(name: str, sender_email: str, message: str) -> tuple[bool, str | None]:
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+        return False, "SMTP not configured"
+
+    body = (
+        f"New collaboration request from {name} <{sender_email}>\n\n"
+        f"Message:\n{message}\n"
+    )
+    msg = MIMEText(body)
+    msg["Subject"] = f"Portfolio Collaboration: {name}"
+    msg["From"] = formataddr(("Portfolio", FROM_EMAIL))
+    msg["To"] = TARGET_EMAIL
+    msg["Reply-To"] = sender_email
+
+    try:
+        if SMTP_PORT == 465:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_EMAIL, [TARGET_EMAIL], msg.as_string())
+        else:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.login(SMTP_USER, SMTP_PASS)
+                server.sendmail(FROM_EMAIL, [TARGET_EMAIL], msg.as_string())
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 @app.post("/api/contact")
 def submit_contact(payload: ContactIn):
     # Save to DB first
@@ -94,33 +137,21 @@ def submit_contact(payload: ContactIn):
         # Not fatal for user, but log and continue
         print("DB save error:", e)
 
-    # Try sending email if SMTP is configured
-    sent = False
-    error = None
-    if SMTP_HOST and SMTP_USER and SMTP_PASS:
-        try:
-            body = f"New collaboration request from {payload.name} <{payload.email}>\n\n" \
-                   f"Message:\n{payload.message}\n"
-            msg = MIMEText(body)
-            msg["Subject"] = f"Portfolio Collaboration: {payload.name}"
-            msg["From"] = FROM_EMAIL
-            msg["To"] = TARGET_EMAIL
+    sent, error = send_email(payload.name, payload.email, payload.message)
 
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=8) as server:
-                server.starttls()
-                server.login(SMTP_USER, SMTP_PASS)
-                server.sendmail(FROM_EMAIL, [TARGET_EMAIL], msg.as_string())
-                sent = True
-        except Exception as e:
-            error = str(e)
-            print("SMTP send error:", error)
+    note = "Stored in DB; email sent." if sent else (
+        "Stored in DB; email not sent (SMTP not configured)." if error == "SMTP not configured" else
+        "Stored in DB; email attempt failed."
+    )
 
     return {
         "ok": True,
         "email_dispatched": sent,
         "target": TARGET_EMAIL,
-        "note": "Stored in DB; email sent if SMTP configured.",
+        "note": note,
         "error": error,
+        "smtp_mode": "SSL" if SMTP_PORT == 465 else "STARTTLS",
+        "from_email": FROM_EMAIL if sent else None,
     }
 
 
